@@ -1,0 +1,322 @@
+from distutils.log import error
+from flask import Response
+import uuid
+from flask import jsonify, make_response, request, send_from_directory, send_file
+from flask_restx import Namespace, Resource
+import flask_jwt_extended as JWT
+from flask_jwt_extended import jwt_required, current_user, get_current_user, get_jwt_identity
+import os
+import docx2txt
+from odf.opendocument import load as load_odf
+from odf.text import P
+import pytesseract
+from pytesseract import TesseractError
+import psycopg2
+from io import BytesIO
+import cv2
+import numpy as np
+from PIL import Image
+from ..auth_middleware import admin_required, login_required
+from ..models import Document,User, Auth, Organisation, OrganisationUser, Product, Subscription
+from werkzeug.datastructures import FileStorage
+from werkzeug.utils import secure_filename
+import imageio
+import io
+import logging
+
+
+document = Namespace('document', description='documentReader')
+upload_parser = document.parser()
+upload_parser.add_argument('file', location='files',
+                           type=FileStorage, required=True)
+download_parser = document.parser()
+
+
+@document.route('/<organisation>')
+class OrganisationDocuments(Resource):
+    @login_required()
+    def get(self, organisation):
+        '''
+        Gets all the documents for a given organisation. 
+        '''
+        try:
+            organisation = Organisation.query.filter_by(Organisation.uri==organisation).first()
+            # check if current user has authorization
+            user = User.query.filter_by(id=get_jwt_identity()).first()       
+            user_organisation = OrganisationUser.query.filter_by(OrganisationUser.user_id==user.id).first()
+            if user_organisation.organisation_id == organisation.id:
+                # user is in correct table, can therefore view any of the documents
+                organisation_document_query = OrganisationDocument.query.filter_by(OrganisationDocument.organisation_id==organisation.id)
+                organisation_documents = []
+                for organisation_document in organisation_document_query:
+                    document = Document.query.filter_by(Document.id==organisation_document.document_id)
+                    organisation_documents.append(document)
+                return {"data": organisation_documents}
+        except Exception as e:
+            return {"error": e}
+
+
+@document.route('/delete/<file_id>')
+class Remove(Resource):
+    @admin_required()
+    def delete(self, file_id):
+        try:
+            document = Document.query.filter(Document.id == file_id).first()
+            document._delete_document()
+            return {"message":"document deleted"}, 200
+        except Exception as e:
+            return {"error": "error getting doc"}, 500
+
+        
+@document.route('/download/<file_id>')
+class Download(Resource):
+    @login_required()
+    def get(self, file_id):
+        try:
+            document = Document.query.filter(Document.id == file_id).first()
+            if not document:
+                return {"error": "Document not found"}, 404
+
+            return send_file(io.BytesIO(document.file_binary), 
+                             mimetype=document.filetype, 
+                             as_attachment=True, 
+                             download_name=document.src)
+        except Exception as e:
+            return {"error": "error getting doc"}, 500
+
+@document.route('/organisation-document/<file_id>')
+class OrganisationDocument(Resource):
+    @login_required()
+    def get(self, file_id):
+        try:
+            document = Document.query.filter(Document.id == file_id).first()
+            return send_file(BytesIO(document.file_binary), mimetype=document.filetype, as_attachment=True, download_name=document.src)
+        except Exception as e:
+            return {"error": "error getting doc"}, 500
+        
+@document.route('/personal-documents')
+class PersonalDocument(Resource):
+    @jwt_required()
+    def post(self):
+        '''upload document file to read - personal documents. Each user has their own unshared document area.'''
+        try:
+            user = User.query.filter_by(id=get_jwt_identity()).first()
+            
+            # Check if the user has a subscription to "Document Analysis"
+            documents_product_id = Product.query.filter_by(name="Document Analysis").first().id
+            user_has_doc_subscription = Subscription.query.filter_by(product_id=documents_product_id, user_id=user.id).first()
+            if user_has_doc_subscription:
+                return {"error": "You are using an incorrect URL for Document Analysis. Please use the appropriate endpoint."}, 400
+
+            # Sum the size of all documents uploaded by the user
+            document_query = Document.query.filter_by(uploaded_by=user.id).all()
+            total_size = sum(doc.file_size for doc in document_query)
+
+            args = upload_parser.parse_args()
+            file = args['file'].read()
+            file_size = len(file)
+
+            # Check if the total size exceeds 10GB
+            if total_size + file_size > 10 * 1024 * 1024 * 1024:  # 10GB in bytes
+                return {"error": "You have exceeded the 10GB storage limit for free users."}, 400
+
+            for document in document_query:
+                # Check to see if the document has already been uploaded by this user
+                if document.get_src() == args['file'].filename and document.get_uploaded_by() == user.id:
+                    return {'data': "This document already exists"}, 201
+
+            file_name, file_filetype = os.path.splitext(args['file'].filename)
+            document_id = str(uuid.uuid1())
+            built_document = Document(document_id, filetype=file_filetype[1:], src=args['file'].filename, uploaded_by=user.id, file_binary=file, file_size=file_size)
+            built_document._save_document()
+
+            return {"data": "Document uploaded successfully"}, 200
+        except Exception as error:
+            return {"error": "An error occurred with the document"}, 500
+
+@document.route('/subscriber-documents')
+class SubscriberDocument(Resource):
+    @login_required()
+    def post(self):
+        '''upload document file to read - personal documents. Each user has their own unshared document area. 
+        '''
+        try:
+            user_id = User.query.filter(User.id==get_jwt_identity()).first().id
+            documents_product_id = Product.query.filter(Product.name=="Document Analysis").first().id
+            user_has_doc_subscription = Subscription.query.filter(Subscription.product_id==documents_product_id and Subscription.user_id==user_id).first()
+            if user_has_doc_subscription:
+                document_query = Document.query.filter(Document.uploaded_by==user_id)
+                args = upload_parser.parse_args()
+                for document in document_query:
+                # check to see if the document has already been uploaded by this user
+                    if document.get_src() == args['file'].filename and document.get_uploaded_by()==user_id:
+                        return {'data:': "This document already exists"}, 201
+                file_name, file_filetype = os.path.splitext(args['file'].filename)
+                document_id = str(uuid.uuid1())
+                file = args['file'].read()
+                file_size = len(file)
+                built_document = Document(document_id, filetype=file_filetype[1:], src=args['file'].filename, uploaded_by=user_id, file_binary=file, file_size=file_size)
+                built_document._save_document()
+                return {"data":"Document uploaded successfully"},200
+            else:
+                return {"data": "The user does not have the required permission"}, 400
+        except Exception as error:
+            return {"error":"An error occurred with the document"}, 500
+
+@document.route('/read/<file_id>')
+class ReadSubscriberDocument(Resource):
+    @login_required()
+    def get(self, file_id):
+        try:
+            user_id = User.query.filter(User.id == get_jwt_identity()).first().id
+            if user_has_document_analysis_subscription(user_id):
+                document = Document.query.filter(Document.id == file_id).first()
+                file_binary = document.file_binary
+                file_extension = document.src.split('.')[-1].lower()
+
+                return handle_file_extension(file_extension, file_binary)
+            else:
+                return {"data": "user doesn't have the right subscription"}, 400
+        except Exception as e:
+            return {"error": "error getting doc"}, 500
+
+
+@document.route('/save-document-text')
+class SaveSubscriberDocumentText(Resource):
+    @login_required()
+    def put(self):
+        try:
+            user_id = User.query.filter(User.id==get_jwt_identity()).first().id
+            if user_has_document_analysis_subscription(user_id):
+                data = request.get_json()
+                file_id = data.get('fileId')
+                new_text = data.get('text')
+
+                document = Document.query.filter(Document.id == file_id and Document.uploaded_by == user_id).first()
+                if document:
+                    document.text = new_text
+                    document.file_binary = io.BytesIO(new_text.encode('utf-8')).getvalue()
+                    document._save_document()
+                    return {"message": "Document text updated"}, 200
+                else:
+                    return {"error": "Document not found or not uploaded by user"}, 404
+            else:
+                return {"error": "User doesn't have the right subscription"}, 400
+        except Exception as e:
+            return {"error": "Error updating document text"}, 500
+
+@document.route('/remove-subscriber-document/<file_id>')
+class RemoveSubscriberDocument(Resource):
+    @jwt_required()
+    def delete(self, file_id):
+        try:
+            user_id = User.query.filter(User.id == get_jwt_identity()).first().id
+            if user_has_document_analysis_subscription(user_id):
+                document = Document.query.filter(Document.id == file_id, Document.uploaded_by == user_id).first()
+                if document:
+                    document._delete_document()
+                    return {"message": "Document deleted"}, 200
+                else:
+                    return {"error": "Document not found or not uploaded by user"}, 404
+            else:
+                return {"error": "User doesn't have the right subscription"}, 400
+        except Exception as e:
+            return {"error": "Error deleting document"}, 500
+  
+def user_has_document_analysis_subscription(user_id):
+    documents_product_id = Product.query.filter(Product.name == "Document Analysis").first().id
+    return Subscription.query.filter(Subscription.product_id == documents_product_id, Subscription.user_id == user_id).first()
+
+
+def handle_file_extension(file_extension, file_binary):
+    if file_extension in ['txt', 'text']:
+        return handle_text_file(file_binary)
+    elif file_extension in ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'heic']:
+        return handle_image_file(file_extension, file_binary)
+    elif file_extension in ['docx']:
+        return handle_docx_file(file_binary)
+    elif file_extension in ['doc']:
+        return handle_doc_file(file_binary)
+    elif file_extension in ['odt', 'odf']:
+        return handle_odf_file(file_binary)
+    else:
+        return {"error": "Unsupported file type"}, 400
+
+def handle_text_file(file_binary):
+    def generate():
+        file_in = io.BytesIO(file_binary)
+        while chunk := file_in.read(4096):
+            yield chunk.decode('utf-8')
+    return Response(generate(), content_type='text/plain')
+
+def handle_image_file(file_extension, file_binary):
+    try:
+        image = convert_image(file_extension, file_binary)
+        text = extract_text_from_image(image)
+        return generate_text_response(text)
+    except pytesseract.TesseractError as e:
+        logging.error(f"Tesseract OCR error: {e}")
+        return {"error": f"Tesseract OCR error: {str(e)}"}, 500
+    except Exception as e:
+        logging.error(f"Error processing image: {e}")
+        return {"error": f"Error processing image: {str(e)}"}, 500
+
+def convert_image(file_extension, file_binary):
+    try:
+        if file_extension == 'heic':
+            with io.BytesIO(file_binary) as input_file:
+                image = imageio.imread(input_file, format='heif')
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        else:
+            with io.BytesIO(file_binary) as input_file:
+                image = cv2.imdecode(np.frombuffer(input_file.read(), np.uint8), cv2.IMREAD_COLOR)
+        return image
+    except Exception as e:
+        logging.error(f"Error converting image: {e}")
+        return {"error": f"Error converting image: {str(e)}"}, 500
+
+
+def extract_text_from_image(image):
+    try:
+        # Use Tesseract's LSTM OCR engine with a configuration suitable for handwriting
+        custom_config = r'--oem 1 --psm 6'
+        text = pytesseract.image_to_string(image, config=custom_config)
+        return text
+    except Exception as e:
+        logging.error(f"Error extracting text from image: {e}")
+        raise
+
+
+def handle_docx_file(file_binary):
+    def generate():
+        text = docx2txt.process(io.BytesIO(file_binary))
+        for line in text.splitlines():
+            yield line + '\n'
+    return Response(generate(), content_type='text/plain')
+
+def handle_doc_file(file_binary):
+    import subprocess
+    import tempfile
+
+    def generate():
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as temp_doc:
+            temp_doc.write(file_binary)
+            temp_doc.flush()
+            temp_doc.close()
+            result = subprocess.run(['antiword', temp_doc.name], stdout=subprocess.PIPE)
+            yield result.stdout.decode('utf-8')
+    return Response(generate(), content_type='text/plain')
+
+def handle_odf_file(file_binary):
+    def generate():
+        file_in = io.BytesIO(file_binary)
+        doc = load_odf(file_in)
+        for paragraph in doc.getElementsByType(P):
+            yield paragraph.firstChild.data + '\n'
+    return Response(generate(), content_type='text/plain')
+
+def generate_text_response(text):
+    def generate():
+        for line in text.splitlines():
+            yield line + '\n'
+    return Response(generate(), content_type='text/plain')
